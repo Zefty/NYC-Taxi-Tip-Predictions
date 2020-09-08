@@ -1,0 +1,582 @@
+---
+title: "Assignment 2"
+author: "Jaime Wu"
+date: "06/09/2020"
+output: html_document
+---
+
+# NYC Taxi - Prediction of taxi tips
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(lubridate)
+library(leaflet)
+library(leaps)
+library(rgdal)
+library(sp)
+```
+
+## Background 
+
+In the USA, a significant part of the wages of many service workers come from tips, nominally voluntary payments by the customer in addition to the listed price. For taxis in New York, tourist advice suggests a tip of 15-20%. Data from two weeks of taxi trips in New York City, including information on the time of day, day of the week, trip distance, price, number of passengers, locations of pickup and dropoff is given. The data from week 2 of January 2016 will be explored, cleaned, and used to construct a model for predicting the amount of tips on the data from week 4 of January 2016. The mean square prediction error will be evaluated to determine the effectiveness and accuracy of the model. 
+
+## Data Exploration and Cleaning
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Load the taxi data for week 2, summarise each variable and inspect for abnormalities 
+week2 <- read_csv("./data/week2.csv")
+week2 %>% summary()
+dim(week2)
+```
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Explore the categorical variables 
+week2 %>% count(VendorID)
+week2 %>% count(payment_type)
+week2 %>% count(RatecodeID)
+week2 %>% count(extra)
+```
+
+According to the data dictionary for yellow taxis, the tip amount is only recorded for credit card transactions. Cash tips are not included, so the cash transactions should be removed. Although many data points will be removed (~870,000), cash transactions will always have zero tips, which is not beneficial for building a model for predicting tips.
+
+The 59 observations with a rate code id of 99 should be removed as it has not been defined in the data dictionary, indicating erroneous data. 
+
+The miscellaneous extras and surcharges should also be converted to a factor since it is defined to only include the \$0.50 overnight and \$1.00 rush hour charges. The 478 observations with a value other than zero should be removed as they are likely errors.
+
+The MTA tax and improvement surcharges are flat fees attached to every NYC taxi ride, so they will provide no additional benefit to the model and should be removed. Likewise, the variable Store and forward flag also provide no additional benefit to the model as it relates to whether or not the taxi had a connection to the server. Removing the flag should not affect the predictions of the taxi tips. Finally, the total amount should also be removed as it already includes the tip amount, and so cannot be used to predict the tip amount.
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Convert some variables into factors and create a new column for trip duration
+dim(week2)
+week2 <- week2 %>% 
+  mutate(
+    VendorID = factor(VendorID), 
+    trip_duration = as.numeric(difftime(tpep_dropoff_datetime, tpep_pickup_datetime, unit = "mins")),
+    RatecodeID_label =  fct_recode(factor(RatecodeID), # Convert the rate code id into its proper label as defined in the data dictionary 
+                                    "Standard Rate"="1",
+                                    "JFK" = "2",
+                                    "Newark" = "3",
+                                    "NassauWestchester" = "4",
+                                    "Negotiated Fare" = "5",
+                                    "Group ride" = "6"),
+    payment_type_label = fct_recode(factor(payment_type), # Convert the payment type id into its proper label as defined in the data dictionary 
+                                    "Credit Card"="1",
+                                    "Cash" = "2",
+                                    "No Charge" = "3",
+                                    "Dispute" = "4"),
+    ) %>%
+  select(-c(mta_tax, improvement_surcharge, store_and_fwd_flag, RatecodeID, payment_type, total_amount)) %>% # Remove unwanted variables  
+  filter(
+    RatecodeID_label != 99, # Filter out the observations with rate code id equal to 99
+    extra == 0 | extra == 0.5 |extra == 1.0, # Filter out the observations that are not zero, rush hour, and overnight charges.
+    payment_type_label != "Cash" # Exclude cash transactions as they don't include the tip amount 
+  ) %>%
+  mutate(
+    extra = factor(extra) # Convert into a factor 
+  )
+dim(week2) 
+```
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Explore the categorical variables graphically  
+week2 %>% 
+  group_by(VendorID) %>%
+  summarise(mean_tip_amount = mean(tip_amount)) %>%
+  ggplot(aes(x = VendorID, y = mean_tip_amount)) + geom_histogram(stat = "identity")
+
+week2 %>% 
+  group_by(payment_type_label) %>%
+  summarise(mean_tip_amount = mean(tip_amount)) %>%
+  ggplot(aes(x = payment_type_label, y = mean_tip_amount)) + geom_histogram(stat = "identity")
+
+week2 %>% 
+  group_by(RatecodeID_label) %>%
+  summarise(mean_tip_amount = mean(tip_amount)) %>%
+  ggplot(aes(x = RatecodeID_label, y = mean_tip_amount)) + geom_histogram(stat = "identity")
+
+week2 %>% 
+  group_by(extra) %>%
+  summarise(mean_tip_amount = mean(tip_amount)) %>%
+  ggplot(aes(x = extra, y = mean_tip_amount)) + geom_histogram(stat = "identity")
+```
+
+The average tip was similar for both taxi vendors. 
+
+The average tip was highest for credit card as expected compared to the other types. 
+
+The average tip is different for each rate code id type. Newark and Westchester has the highest average tip which is expected as they are one of the richest counties/regions of the US. JFK is likely referring to the airport which is also expected to have a higher tip than the other types. The negotiated fare type being higher than the standard rate also is logical as passengers would be more happy and likely to tip the taxi driver. 
+
+The average tip decreases as extra charges are incurred which is also logically sound; however, the difference is not extremely significant. 
+
+There are likely interactions between these categorical variables, with the most probably variable being the rate code id label. The other variables do not appear to have as much of an effect on tip amount. 
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Explore numerical variables first and clean if necessary
+week2 %>% ggplot(aes(x = trip_distance)) + geom_histogram()
+week2 %>% ggplot(aes(x = trip_duration)) + geom_histogram()
+week2 %>% ggplot(aes(x = fare_amount)) + geom_histogram()
+week2 %>% ggplot(aes(x = tip_amount)) + geom_histogram()
+week2 %>% ggplot(aes(x = tolls_amount)) + geom_histogram()
+week2 %>% ggplot(aes(x = passenger_count)) + geom_histogram()
+
+week2 %>% count(trip_distance > 0) # Unlikely for trip distance to be 0 or less 
+week2 %>% count(trip_duration > 0) # Unlikely for trip duration to be 0 or less 
+week2 %>% count(fare_amount > 0) # Unlikely for fare to be 0 or less 
+week2 %>% count(tip_amount >= 0) # Unlikely for negative tips
+week2 %>% count(tolls_amount >= 0) # Unlikely for negative tolls
+```
+
+The summary statistics of the numerical variables, trip distance, fare amount, tip amount, and toll amount show that they all have maximum values that are beyond the 3rd quartile by a significant amount. Additionally, the plots of the numerical variables show that there are extreme outliers in the data that should be removed. 
+
+It is also unlikely that these numerical variables are negative, and there are not many observations with negative values, so it is probably that those observations are errors and should be removed.
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Filter numerical variables within a holistic range 
+dim(week2)
+week2 <- week2 %>%
+  filter(
+    trip_distance > 0, 
+    trip_distance <= 50, 
+    trip_duration > 0, 
+    trip_duration <= 120, 
+    fare_amount > 0,
+    fare_amount <= 100,
+    tip_amount >= 0,
+    tip_amount <= 50,
+    tolls_amount >= 0,
+    tolls_amount <= 50
+    )  
+dim(week2)
+
+# Re-examine numerical variables and look for obvious outliers 
+week2 %>% ggplot(aes(x = trip_distance)) + geom_histogram()
+week2 %>% ggplot(aes(x = trip_duration)) + geom_histogram()
+week2 %>% ggplot(aes(x = fare_amount)) + geom_histogram()
+week2 %>% ggplot(aes(x = tip_amount)) + geom_histogram()
+week2 %>% ggplot(aes(x = tolls_amount)) + geom_histogram()
+```
+
+The numerical variables, trip distance, fare amount, tip amount, and tolls amount was holistically filtered with an upper range, removing approximately 10,000 observations which is reasonable as this is less than 1% of the total data. The number of passengers does not appear to have any outliers in the data, so no observations were removed. 
+
+The plots appear sensible post-filtration, but the spike in the number of fare amounts around $50.00 is questionable, nevertheless is still a fair distribution. The histogram of the amount of the tolls seems categorical, with a majority of trips having no tolls, so the amount of the tolls can be factored into two levels: toll or no toll. The numerical variables are all right-skewed which means that the median will give a better measure of centrality.  
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Convert tolls amount into a factor: true if there is a toll for the trip, and false if there is no toll for the trip. 
+week2 <- week2 %>%
+  mutate(
+    toll = factor(tolls_amount != 0)
+  ) %>%
+  select(
+    -tolls_amount
+  )
+```
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Exploration of the numerical variables with tip amount 
+week2 %>% sample_n(1e4) %>% ggplot(aes(x = trip_duration, y = tip_amount)) + geom_point() + geom_smooth(method = "lm")
+week2 %>% sample_n(1e4) %>% ggplot(aes(x = trip_distance, y = tip_amount)) + geom_point() + geom_smooth(method = "lm")
+week2 %>% sample_n(1e4) %>% ggplot(aes(x = fare_amount, y = tip_amount)) + geom_point() + geom_smooth(method = "lm")
+week2 %>% group_by(toll) %>% summarise(med_tip_amount = median(tip_amount)) %>% ggplot(aes(x = toll, y = med_tip_amount)) + geom_bar(stat = "identity")
+```
+
+The plots are as expected, and there is an obvious positive linear relationship between trip distance and tip amount, trip duration and tip amount, and fare amount and tip amount. Multicollinearity is likely to be present in the data as the trip distance, trip duration, and fare amount are all positively correlated to the tip amount. The interesting result from these plots is a trip with toll results in a larger median tip. 
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Quick plot of the hourly pattern 
+week2 %>%
+  ggplot(aes(x = factor(hour(tpep_pickup_datetime)))) + geom_bar()
+```
+
+The pickup and dropoff time data is in the NYC timezone as the hourly pickup of passengers look reasonably realistic and follows a day-night cycle. The pickup time of day will be factored into four categories to reflect the day-night cycle, with morning (6am - 12pm), afternoon (12pm - 6pm), evening (6pm - 12am) and night (12am - 6am). Similarly, the dropoff time of day will also be converted to a factor in the same way.  
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Converting pickup time into time of day factor 
+# Retrieved from https://stackoverflow.com/questions/50304159/label-day-timing-into-morning-afternoon-and-evening-in-r
+week2 <- week2 %>% 
+  mutate(
+    pickup_time_of_day = cut(x = hour(tpep_pickup_datetime), breaks = hour(hm("00:00", "6:00", "12:00", "18:00", "23:59")), labels = c("Night", "Morning", "Afternoon", "Evening"), include.lowest = TRUE),
+    dropoff_time_of_day = cut(x = hour(tpep_dropoff_datetime), breaks = hour(hm("00:00", "6:00", "12:00", "18:00", "23:59")), labels = c("Night", "Morning", "Afternoon", "Evening"), include.lowest = TRUE)
+  )
+```
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Visualise variation of the tip amounts over the day   
+week2 %>%
+  group_by(pickup_time_of_day) %>%
+  summarise(med_tip = median(tip_amount)) %>%
+  ggplot(aes(x = pickup_time_of_day, y = med_tip, group = 1)) + geom_point() + geom_line()
+
+week2 %>%
+  group_by(dropoff_time_of_day) %>%
+  summarise(med_tip = median(tip_amount)) %>%
+  ggplot(aes(x = dropoff_time_of_day, y = med_tip, group = 1)) + geom_point() + geom_line()
+
+week2 %>%
+  group_by(pickup_time_of_day) %>%
+  summarise(mean_tip = mean(tip_amount)) %>%
+  ggplot(aes(x = pickup_time_of_day, y = mean_tip, group = 1)) + geom_point() + geom_line()
+
+week2 %>%
+  group_by(dropoff_time_of_day) %>%
+  summarise(mean_tip = mean(tip_amount)) %>%
+  ggplot(aes(x = dropoff_time_of_day, y = mean_tip, group = 1)) + geom_point() + geom_line()
+```
+
+There are variations in the tip amount over the day. The evening and night tend to high a higher average and median tip than in the morning and this increases in the afternoon. Perhaps, passengers are more likely to tip drivers that working later in the day and appreciate their late shifts.
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Create day of the week column
+week2 <- week2 %>%
+  mutate(
+    dow = factor(wday(tpep_pickup_datetime, label = TRUE, abbr = TRUE, week_start = 1)), 
+  )
+
+# Remove date time variables as they have been converted into factors 
+week2 <- week2 %>%
+  select(-c(tpep_pickup_datetime, tpep_dropoff_datetime))
+```
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Visualise variations over the week 
+week2 %>% ggplot(aes(x = dow)) + geom_bar()
+
+# Visualise variations of the tip amounts over the week 
+week2 %>%
+  group_by(dow) %>%
+  summarise(med_tip = median(tip_amount)) %>%
+  ggplot(aes(x = dow, y = med_tip, group = 1)) + geom_point() + geom_line()
+
+week2 %>%
+  group_by(dow) %>%
+  summarise(mean_tip = mean(tip_amount)) %>%
+  ggplot(aes(x = dow, y = mean_tip, group = 1)) + geom_point() + geom_line()
+```
+
+The number of trips over each day of the week seems reasonable - there does not appear to be any patterns or variations. However, the tip amount varies over the course of the week, with the tip amount increasing at the start of the week to a maximum during the middle of the week and then decreases over the weekend. The lower tip amount over the weekend is somewhat surprising as the number of trips is similar throughout the week, and it is normally expected that people tip more when they go out more during the weekend. 
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Explore location data
+week2 %>% sample_n(1e4) %>% leaflet() %>% addTiles() %>% addCircleMarkers(~pickup_longitude, ~pickup_latitude, radius = 2) %>% addCircleMarkers(~dropoff_longitude, ~dropoff_latitude, radius = 2, color = "Red")
+```
+The NYC taxi data should only have data that is located within New York. The locations recorded outside New York are likely due to an error in the data collection process, i.e. malfunctioning GPS, in which case those observations should be removed. 
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Ensure all data points are in NYC 
+dim(week2)
+week2 <- week2 %>% 
+  filter(
+    pickup_latitude > 40.495992, 
+    pickup_latitude < 40.915568, 
+    pickup_longitude > -74.257159, 
+    pickup_longitude < -73.699215, 
+    dropoff_latitude > 40.495992, 
+    dropoff_latitude < 40.915568, 
+    dropoff_longitude > -74.257159, 
+    dropoff_longitude < -73.699215, 
+    )  
+dim(week2) # Approximately 30,000 observations are removed which is not too significant
+```
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Read in the borough boundaries of NYC from shape files 
+nyboroughs <- readOGR("./data/Borough Boundaries")
+
+# Define pickup and dropoff locations as spatial points 
+pickup_points <- week2 %>% select(longitude = pickup_longitude, latitude = pickup_latitude) %>% SpatialPoints(proj4string = CRS(proj4string(nyboroughs))) 
+dropoff_points <- week2 %>% select(longitude = dropoff_longitude, latitude = dropoff_latitude) %>% SpatialPoints(proj4string = CRS(proj4string(nyboroughs)))
+
+# Categorise pickup and dropoff locations into boroughs via the intersection between the spatial points and the spatial polygons 
+pickup_borough = over(pickup_points, nyboroughs)
+dropoff_borough = over(dropoff_points, nyboroughs)
+
+# Replace the pickup and dropoff lat/long with the corresponding pickup and dropoff borough 
+week2 <- week2 %>% 
+  mutate(
+    pickup_borough = pickup_borough$boro_name,
+    dropoff_borough = dropoff_borough$boro_name
+  ) %>% 
+  select(-c(pickup_longitude, pickup_latitude, dropoff_longitude, dropoff_latitude))
+
+# Remove any missing data 
+dim(week2)
+week2 <- week2[!rowSums(is.na(week2)) > 0,]
+dim(week2) # About 5000 observations have missing data which is not a lot so we can remove them 
+```
+
+After cleaning the week 2 data, the number of observations reduced from 2651287 to 1741791, which is about 900,000. Although this is quite a fair amount of data, approximately 870,000 of those data points come from cash transactions. As explained previously, tips for cash transactions are not recorded according to the data dictionary and would not help to build a model. Overall, only 30,000 observations were removed that were not cash transactions, and this is an acceptable amount. 
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Save cleaned data
+write_csv(week2, "./data/week2clean.csv")
+```
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Clear memory so R can knit file
+rm(list=ls())
+gc()
+```
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Week 4 taxi data 
+week4 <- read_csv("./data/week4.csv")
+week4 %>% summary()
+```
+
+The summary statistics of week 4's data is similar to week 2, so the same cleaning procedure can be applied to clean week 4's data.
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Clean week 4 data in the same way as week 2 data
+dim(week4)
+week4 <- week4 %>% 
+  mutate(
+    VendorID = factor(VendorID), 
+    trip_duration = as.numeric(difftime(tpep_dropoff_datetime, tpep_pickup_datetime, unit = "mins")),
+    RatecodeID_label =  fct_recode(factor(RatecodeID), # Convert the rate code id into its proper label as defined in the data dictionary 
+                                    "Standard Rate"="1",
+                                    "JFK" = "2",
+                                    "Newark" = "3",
+                                    "NassauWestchester" = "4",
+                                    "Negotiated Fare" = "5",
+                                    "Group ride" = "6"),
+    payment_type_label = fct_recode(factor(payment_type), # Convert the payment type id into its proper label as defined in the data dictionary 
+                                    "Credit Card"="1",
+                                    "Cash" = "2",
+                                    "No Charge" = "3",
+                                    "Dispute" = "4"),
+    ) %>%
+  select(-c(mta_tax, improvement_surcharge, store_and_fwd_flag, RatecodeID, payment_type, total_amount)) %>% # Remove unwanted variables  
+  filter(
+    RatecodeID_label != 99, # Filter out the observations with rate code id equal to 99
+    extra == 0 | extra == 0.5 |extra == 1.0, # Filter out the observations that are not zero, rush hour, and overnight charges.
+    payment_type_label != "Cash", # Exclude cash transactions as they don't include the tip amount 
+    trip_distance > 0,  # Use the same holistic range for the numerical variables 
+    trip_distance <= 50, 
+    trip_duration > 0, 
+    trip_duration <= 120, 
+    fare_amount > 0,
+    fare_amount <= 100,
+    tip_amount >= 0,
+    tip_amount <= 50,
+    tolls_amount >= 0,
+    tolls_amount <= 50,
+    pickup_latitude > 40.495992, # Only include data from within NYC 
+    pickup_latitude < 40.915568, 
+    pickup_longitude > -74.257159, 
+    pickup_longitude < -73.699215, 
+    dropoff_latitude > 40.495992, 
+    dropoff_latitude < 40.915568, 
+    dropoff_longitude > -74.257159, 
+    dropoff_longitude < -73.699215, 
+  ) %>%
+  mutate(
+    toll = factor(tolls_amount != 0), # Convert the tolls amount into whether trip had toll or not 
+    pickup_time_of_day = cut(x = hour(tpep_pickup_datetime), breaks = hour(hm("00:00", "6:00", "12:00", "18:00", "23:59")), labels = c("Night", "Morning", "Afternoon", "Evening"), include.lowest = TRUE), # Convert time into day/night cycle
+    dropoff_time_of_day = cut(x = hour(tpep_dropoff_datetime), breaks = hour(hm("00:00", "6:00", "12:00", "18:00", "23:59")), labels = c("Night", "Morning", "Afternoon", "Evening"), include.lowest = TRUE),
+    dow = factor(wday(tpep_pickup_datetime, label = TRUE, abbr = TRUE, week_start = 1)), # Include day of the week 
+    extra = factor(extra)
+  ) %>%
+  select(
+    -c(tolls_amount,tpep_pickup_datetime, tpep_dropoff_datetime)
+  )
+dim(week4)
+
+# Categorise pickup and dropoff locations into boroughs via the intersection between the spatial points and the spatial polygons 
+nyboroughs <- readOGR("./data/Borough Boundaries")
+pickup_points <- week4 %>% select(longitude = pickup_longitude, latitude = pickup_latitude) %>% SpatialPoints(proj4string = CRS(proj4string(nyboroughs)))
+dropoff_points <- week4 %>% select(longitude = dropoff_longitude, latitude = dropoff_latitude) %>% SpatialPoints(proj4string = CRS(proj4string(nyboroughs)))
+
+pickup_borough = over(pickup_points, nyboroughs)
+dropoff_borough = over(dropoff_points, nyboroughs)
+
+week4 <- week4 %>% 
+  mutate(
+    pickup_borough = pickup_borough$boro_name,
+    dropoff_borough = dropoff_borough$boro_name
+  ) %>% 
+  select(-c(pickup_longitude, pickup_latitude, dropoff_longitude, dropoff_latitude))
+
+# Remove any missing data 
+dim(week4)
+week4 <- week4[!rowSums(is.na(week4)) > 0,]
+dim(week4) 
+```
+After cleaning the week 4's data, the number of observations reduced from 2010309 to 1342090, which is acceptable, as most of the data being removed is related to cash transactions.  
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Save cleaned data
+write_csv(week4, "./data/week4clean.csv")
+```
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Clear memory so R can knit file 
+rm(list=ls())
+gc()
+```
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Read clean data
+week2clean <- read_csv("./data/week2clean.csv")
+week4clean <- read_csv("./data/week4clean.csv")
+```
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Since data is being reloaded into memory, need to convert some variables back into factors 
+week2clean <- week2clean %>%
+  mutate(
+    VendorID = factor(VendorID, ordered = FALSE),
+    extra = factor(extra, ordered = FALSE),
+    RatecodeID_label = factor(RatecodeID_label, ordered = FALSE),
+    payment_type_label = factor(payment_type_label, ordered = FALSE),
+    toll = factor(toll, ordered = FALSE),
+    pickup_time_of_day = factor(pickup_time_of_day, ordered = FALSE),
+    dropoff_time_of_day = factor(dropoff_time_of_day, ordered = FALSE),
+    dow = factor(dow, ordered = FALSE),
+    pickup_borough = factor(pickup_borough, ordered = FALSE),
+    dropoff_borough = factor(dropoff_borough, ordered = FALSE)
+  )
+
+week4clean <- week4clean %>%
+  mutate(
+    VendorID = factor(VendorID, ordered = FALSE),
+    extra = factor(extra, ordered = FALSE),
+    RatecodeID_label = factor(RatecodeID_label, ordered = FALSE),
+    payment_type_label = factor(payment_type_label, ordered = FALSE),
+    toll = factor(toll, ordered = FALSE),
+    pickup_time_of_day = factor(pickup_time_of_day, ordered = FALSE),
+    dropoff_time_of_day = factor(dropoff_time_of_day, ordered = FALSE),
+    dow = factor(dow, ordered = FALSE),
+    pickup_borough = factor(pickup_borough, ordered = FALSE),
+    dropoff_borough = factor(dropoff_borough, ordered = FALSE)
+  )
+```
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Explore some interactions between variables 
+week2cleanSample <- week2clean %>% sample_n(1e5)
+interaction.plot(week2cleanSample$pickup_borough, week2cleanSample$dropoff_borough, week2cleanSample$tip_amount)
+interaction.plot(week2cleanSample$pickup_time_of_day, week2cleanSample$dropoff_time_of_day, week2cleanSample$tip_amount)
+interaction.plot(week2cleanSample$pickup_time_of_day, week2cleanSample$pickup_borough, week2cleanSample$tip_amount)
+```
+
+The pickup and dropoff locations/time does have interaction. The pickup and dropoff locations/time does affect the amount of tip as expected 
+
+```{r}
+interaction.plot(week2cleanSample$dow, week2cleanSample$pickup_borough, week2cleanSample$tip_amount)
+interaction.plot(week2cleanSample$dow, week2cleanSample$pickup_time_of_day, week2cleanSample$tip_amount)
+interaction.plot(week2cleanSample$dow, week2cleanSample$extra, week2cleanSample$tip_amount)
+```
+
+There is also interaction between pickup location/time of day over the week and as the extra charges depend on the time we also see an interaction. The pickup location and time over the week matters as day/night and weekend/weekday tipping might be different 
+
+```{r}
+interaction.plot(week2cleanSample$pickup_borough, week2cleanSample$toll, week2cleanSample$tip_amount)
+interaction.plot(week2cleanSample$pickup_time_of_day, week2cleanSample$toll, week2cleanSample$tip_amount)
+interaction.plot(week2cleanSample$dow, week2cleanSample$toll, week2cleanSample$tip_amount)
+```
+
+No interaction for toll. When there is toll for the trip, passengers generally tend to tip more regardless of other variables. 
+
+```{r}
+interaction.plot(week2cleanSample$passenger_count, week2cleanSample$pickup_time_of_day, week2cleanSample$tip_amount)
+interaction.plot(week2cleanSample$passenger_count, week2cleanSample$dow, week2cleanSample$tip_amount)
+```
+
+There is interaction between number of passengers and the location, time of day, and day of the week. Perhaps in the weekend and at evening/night time, people are going out and willing to tip more?
+
+There are many more variables that could have interaction but these are likely to be the most significant.
+
+## NYC Taxi Modelling and Predictions 
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+set.seed("442689185")
+
+# Cross validation
+allyhat<-function(xtrain, ytrain, xtest,lambdas,nvmax=50){
+  n<-nrow(xtrain)
+  yhat<-matrix(nrow=nrow(xtest),ncol=length(lambdas))
+  search<-regsubsets(xtrain,ytrain, nvmax=nvmax, method="back")
+  summ<-summary(search)
+  for(i in 1:length(lambdas)){
+    penMSE<- n*log(summ$rss)+lambdas[i]*(1:nvmax)
+    best<-which.min(penMSE)  # Lowest AIC
+    betahat<-coef(search, best) # Coefficients
+    xinmodel<-cbind(1,xtest)[,summ$which[best,]] # Predictors in that model
+    yhat[,i]<-xinmodel%*%betahat
+  }
+  yhat
+}
+
+# Create model 
+model <- lm(tip_amount~., data = week2clean)
+X <- model.matrix(model)[,-1]
+y <- week2clean$tip_amount
+
+# Find best lambda for penalty 
+n<-nrow(X)
+folds<-sample(rep(1:10,length.out=n))
+lambdas<-c(2,4,8,16,32,64)
+fitted<-matrix(nrow=n,ncol=length(lambdas))
+for(k in 1:10){
+  train <- (1:n)[folds!=k]
+  test <-(1:n)[folds==k]
+  fitted[test,]<-allyhat(X[train,],y[train],X[test,],lambdas,nvmax=30)  
+}
+colMeans((y-fitted)^2)
+```
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Lambda = 16 has best penalty 
+model <- lm(tip_amount~., data = week2clean)
+X <- model.matrix(model)[,-1]
+y <- week2clean$tip_amount
+
+bsearch <- regsubsets(X, y, nvmax = 30, method = "backward")
+aic <- nrow(X)*log(summary(bsearch)$rss) + 4*(1:30)
+best <- which.min(aic) # Lowest AIC 
+coef(bsearch, best) # Coefficients for the best model
+
+# Calculate MSPE for week 2 training data 
+betahat <- coef(bsearch, best)
+xinmodel <- cbind(1,X)[,summary(bsearch)$which[best,]]
+yhatAll2 <- xinmodel%*%betahat
+spe <- (week2clean$tip_amount - yhatAll2)^2
+summary(spe)
+```
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Use week 4 as test data to obtain MSPE of the model 
+model <- lm(tip_amount~., data = week4clean)
+X <- model.matrix(model)[,-1]
+y <- week4clean$tip_amount
+
+# Calculate MSPE for week 4 test data 
+betahat <- coef(bsearch, best)
+xinmodel <- cbind(1,X)[,summary(bsearch)$which[best,]]
+yhatAll2 <- xinmodel%*%betahat
+spe <- (week4clean$tip_amount - yhatAll2)^2
+summary(spe)
+```
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+# Compare MSPE against tip amount 
+mean(week2clean$tip_amount)
+mean(week4clean$tip_amount)
+median(week2clean$tip_amount)
+median(week4clean$tip_amount)
+```
+
+A model was created using data from week 2 of January 2016 to predict the tip amount for yellow taxis in NYC. A predictive modeling objective denotes the need to construct a model via crossvalidation with penalty tuning on subset selection of linear regression models  rather than simply fitting all the explanatory variables to a response variable in a linear model. In the exploration analysis section above, there are clear interactions between particular categorical variables; however, given the lack of resources (RAM and CPU), those interactions were not included in the model. 
+
+As the goal is to achieve accurate predictions, the model fitting procedure will need to fit variables by minimising the mean squared prediction errors (MSPE). The apparent error of a model is not an consistent estimator of the MSPE, since the apparent error usually decreases as more predictors are introduced into the model, whereas adding unrelated predictors will typically worsen the MSPE. Thus, the predictive model should not be overfitted to the training data. Therefore, to obtain an honest and unbiased estimation of MSPE, k-fold crossvalidation with penalty tuning on simple linear regression subset selection was used. 
+
+The training data (week 2 data) was divided into k subsets (folds). For each fold not in the kth fold, a linear model was created with subset selection and penalty tuning, and then used to predict on the kth fold to compute an estimate of the MSPE. The k-fold crossvalidation computes an unbiased estimation of the MSPE for each observation of week 2's data via the model fitting strategy. The model fitting strategy used was a best subset selection of the best p variables with a backward selection approach. Backward selection was used instead of forward or stepwise because we have significantly more data than the number of predictors in the model which greatly increases the chances of finding the most optimal model that minimises MSPE. The model fitting stratgey also includes a cost complexity penalty term lambda that penalises a model for being too complex (i.e. having to many predictor variables). Having many predictor variables will likely lead to an improvement in apparent error/RSS; however, usually at the cost of overfitting to the training data and thus worsen the MSPE of the model. The best penalty term is lambda equal to 16, and this was used to find the best model that minimises MSPE via best backward subset selection using the regsubsets package.
+
+The best model has the following predictor variables: 
+
+```{r cache = TRUE, message=FALSE, warning=FALSE}
+coef(bsearch, best)
+```
+
+The mean squared prediction error of the test data (week 4) is 1.879244. Given that the average tip amount is around \$2.60, a MSPE of 1.879244 means that most predictions are approximately $1.34 away from the true tip amount. The prediction error is quite large, so the model is not very accurate for predictions. MSPE penalises larger errors more significantly, even if they are infrequent, will increase the MSPE. For instance, most of the time, the tip amount is reasonably and accurately predicted by the model; however, there are certain situations where the actual tip is much higher than what has been predicted by the model. Thus, the squared prediction errors is heavily right skewed and the maximum error is many order of magnitudes beyond the upper quartile. The model could be improved with the addition of interactions between variables such as the ones found in the exploratory analysis section above. Nevertheless, the MSPE is very large for the model so it is not accurate or suitable for making predictions.  
+
